@@ -108,14 +108,10 @@ class PurchaseOrderRecommendation(models.TransientModel):
     def _get_move_line_domain(self, products, src, dst):
         """Allows to easily extend the domain by third modules"""
         combine = datetime.combine
-        # We can receive a context to be able to get different dates with
-        # the same wizard attributes, for example comparing periods
-        date_begin = self.env.context.get("period_date_begin", self.date_begin)
-        date_end = self.env.context.get("period_date_end", self.date_end)
         domain = [
             ("product_id", "in", products.ids),
-            ("date", ">=", combine(date_begin, datetime.min.time())),
-            ("date", "<=", combine(date_end, datetime.max.time())),
+            ("date", ">=", combine(self.date_begin, datetime.min.time())),
+            ("date", "<=", combine(self.date_end, datetime.max.time())),
             ("location_id.usage", "=", src),
             ("location_dest_id.usage", "=", dst),
             ("state", "=", "done"),
@@ -175,21 +171,9 @@ class PurchaseOrderRecommendation(models.TransientModel):
                 found_lines.update({product.id: {"product_id": product}})
         return found_lines
 
-    def _prepare_wizard_line_from_seller(self, vals, seller):
-        """Allow to add values coming from the selected seller, which will have
-        more priority than existing prepared values.
-
-        :param vals: Existing wizard line dictionary vals.
-        :param seller: Selected seller for this line.
-        """
-        self.ensure_one()
-        return {
-            "price_unit": seller.price,
-        }
-
+    @api.model
     def _prepare_wizard_line(self, vals, order_line=False):
         """Used to create the wizard line"""
-        self.ensure_one()
         product_id = order_line and order_line.product_id or vals["product_id"]
         if self.warehouse_ids:
             units_available = sum(
@@ -212,17 +196,21 @@ class PurchaseOrderRecommendation(models.TransientModel):
         )
         vals["is_modified"] = bool(qty_to_order)
         units_included = order_line and order_line.product_qty or qty_to_order
-        seller = product_id._select_seller(
+        price_unit = product_id._select_seller(
             partner_id=self.order_id.partner_id,
             date=fields.Date.today(),
             quantity=units_included,
             uom_id=product_id.uom_po_id,
-        )
-        res = {
+        ).price
+        currency_id = product_id._select_seller(
+            partner_id=self.order_id.partner_id,
+            date=fields.Date.today(),
+            quantity=units_included,
+            uom_id=product_id.uom_po_id,
+        ).currency_id
+        return {
             "purchase_line_id": order_line and order_line.id,
             "product_id": product_id.id,
-            "product_name": product_id.name,
-            "product_code": product_id.code,
             "times_delivered": vals.get("times_delivered", 0),
             "times_received": vals.get("times_received", 0),
             "units_received": vals.get("qty_received", 0),
@@ -233,10 +221,10 @@ class PurchaseOrderRecommendation(models.TransientModel):
             ),
             "units_delivered": vals.get("qty_delivered", 0),
             "units_included": units_included,
+            "price_unit": price_unit,
+            "currency_id": currency_id,
             "is_modified": vals.get("is_modified", False),
         }
-        res.update(self._prepare_wizard_line_from_seller(res, seller))
-        return res
 
     @api.onchange(
         "order_id",
@@ -264,9 +252,6 @@ class PurchaseOrderRecommendation(models.TransientModel):
                 found_dict[product] = line
             found_dict[product]["qty_delivered"] = line.get("qty_done", 0)
             found_dict[product]["times_delivered"] = line.get("product_id_count", 0)
-            found_dict[product].update(
-                {k: v for k, v in line.items() if k not in found_dict[product].keys()}
-            )
         RecomendationLine = self.env["purchase.order.recommendation.line"]
         existing_product_ids = []
         # Add products from purchase order lines
@@ -324,8 +309,6 @@ class PurchaseOrderRecommendationLine(models.TransientModel):
         related="wizard_id.order_id.partner_id", readonly=True,
     )
     product_id = fields.Many2one(comodel_name="product.product", string="Product",)
-    product_name = fields.Char(string="Product name")
-    product_code = fields.Char(string="Product reference")
     price_unit = fields.Monetary(readonly=True,)
     times_delivered = fields.Integer(readonly=True,)
     times_received = fields.Integer(readonly=True,)
@@ -354,6 +337,12 @@ class PurchaseOrderRecommendationLine(models.TransientModel):
             quantity=self.units_included,
             uom_id=self.product_id.uom_po_id,
         ).price
+        self.currency_id = self.product_id._select_seller(
+            partner_id=self.partner_id,
+            date=fields.Date.today(),
+            quantity=self.units_included,
+            uom_id=self.product_id.uom_po_id,
+        ).currency_id
 
     def _prepare_update_po_line(self):
         """So we can extend PO update"""
